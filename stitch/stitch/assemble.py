@@ -1590,7 +1590,7 @@ def stitch(
         # Peak ~15GB GPU per worker (numer+denom+tile temps in float16).
         # Use 18GB divisor per device: A100-80GB→4/gpu, H200-141GB→7/gpu, A40-48GB→2/gpu.
         from ops_utils.hpc.gpu_utils import _setup_gpu_environment
-        from ops_utils.hpc.parallel_utils import GPUWorkerPlugin
+        from ops_utils.hpc.parallel_utils import MultiGPUCluster
         available_gpus = _setup_gpu_environment()
         n_gpus = len(available_gpus)
 
@@ -1599,11 +1599,13 @@ def stitch(
             per_gpu_mb = xp.cuda.Device(0).mem_info[1]
             per_gpu_gb = per_gpu_mb / 1e9
             workers_per_gpu = max(1, int(per_gpu_gb // 18))
-            n_dask_workers = min(workers_per_gpu * n_gpus, len(work_queue))
+            n_dask_workers = workers_per_gpu * n_gpus
+            n_dask_workers = min(n_dask_workers, len(work_queue))
             print(f"[Dask Bands] {n_gpus} GPU(s), {per_gpu_gb:.0f}GB each → "
                   f"{workers_per_gpu}/gpu × {n_gpus} = {n_dask_workers} workers")
         else:
-            n_dask_workers = min(4, len(work_queue))
+            workers_per_gpu = min(4, len(work_queue))
+            n_dask_workers = workers_per_gpu
             print(f"[Dask Bands] No GPU detected, using {n_dask_workers} CPU workers")
 
         # threads_per_worker=1: each worker runs one long-lived task (loop
@@ -1612,19 +1614,16 @@ def stitch(
         if cuda_path:
             os.environ['CUDA_PATH'] = cuda_path  # workers inherit parent env
 
-        # Clear parent CUDA_VISIBLE_DEVICES so workers don't all bind to the
-        # same device. GPUWorkerPlugin will set it per-worker via round-robin.
+        # Use MultiGPUCluster for proper CUDA_VISIBLE_DEVICES isolation.
+        # Creates one LocalCluster per GPU with env set BEFORE worker spawn.
         parent_cuda_devices = os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
-        # Disable Dask's per-worker memory limit — workers hold ~28-42GB each
-        # (current tile_cache + prefetched tile_cache + norm_cpu + prev norm_cpu).
-        cluster = LocalCluster(n_workers=n_dask_workers, threads_per_worker=1,
-                               memory_limit=0)
-        client = Client(cluster)
-
-        # Assign GPUs round-robin: worker 0→GPU0, worker 1→GPU1, ...
-        if n_gpus > 0:
-            client.register_worker_plugin(GPUWorkerPlugin(available_gpus))
+        multi_cluster = MultiGPUCluster(
+            available_gpus, workers_per_gpu,
+            threads_per_worker=1, memory_limit=0,
+        )
+        # Use first client for submitting work (round-robin handled internally)
+        client = multi_cluster.clients[0]
 
         cpu_monitor_stop = None
         try:
@@ -1647,7 +1646,7 @@ def stitch(
             for chunk in worker_chunks:
                 if not chunk:
                     continue
-                future = client.submit(
+                future = multi_cluster.submit(
                     _stitch_bands_loop_worker,
                     band_list=chunk,
                     output_store_path=output_store_path,
@@ -1683,11 +1682,8 @@ def stitch(
         finally:
             if cpu_monitor_stop is not None:
                 cpu_monitor_stop.set()
-            try:
-                client.close()
-                cluster.close(timeout=120)
-            except Exception:
-                pass
+            if multi_cluster is not None:
+                multi_cluster.close()
             # Restore parent CUDA_VISIBLE_DEVICES
             if parent_cuda_devices is not None:
                 os.environ["CUDA_VISIBLE_DEVICES"] = parent_cuda_devices
