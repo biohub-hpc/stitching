@@ -2962,10 +2962,27 @@ def stitch(
         from concurrent.futures import ProcessPoolExecutor as _PPE
 
         stripes_per_well = max(1, int(os.environ.get("STITCH_STRIPES_PER_WELL", "4")))
-        max_workers_env = int(os.environ.get(
-            "STITCH_STRIPE_WORKERS",
-            str(min(num_wells * stripes_per_well, 6))
-        ))
+        # Per-GPU worker count. The stripe-level ProcessPoolExecutor below
+        # spawns subprocess workers and previously did NOT pin a GPU per
+        # worker — all workers inherited the parent's CUDA_VISIBLE_DEVICES
+        # (both GPUs visible) and CuPy defaulted to GPU 0. With 5+ workers
+        # × ~5 GB allocations on a single 80 GB device, we hit cupy OOM
+        # while the second allocated GPU sat idle.
+        # New default: max_workers = workers_per_gpu * n_gpus, with each
+        # worker pinned to one GPU via the initializer below. n_gpus and
+        # available_gpus are derived from the parent's CUDA_VISIBLE_DEVICES.
+        try:
+            from ops_utils.hpc.gpu_utils import _setup_gpu_environment as _setup_gpus
+            _stripe_avail_gpus = _setup_gpus() or [0]
+        except Exception:
+            _stripe_avail_gpus = [int(x) for x in os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",") if x]
+            if not _stripe_avail_gpus:
+                _stripe_avail_gpus = [0]
+        _stripe_n_gpus = len(_stripe_avail_gpus)
+        workers_per_gpu = max(1, int(os.environ.get("STITCH_STRIPE_WORKERS_PER_GPU", "1")))
+        default_workers = min(num_wells * stripes_per_well, workers_per_gpu * _stripe_n_gpus)
+        max_workers_env = int(os.environ.get("STITCH_STRIPE_WORKERS", str(default_workers)))
+        max_workers_env = max(1, max_workers_env)
         # Pre-create plate, positions, AND output arrays in the parent so
         # workers don't race on iohub writes. Workers open the array as
         # raw zarr.
@@ -3024,6 +3041,11 @@ def stitch(
             if k.startswith("STITCH_") or k.startswith("CUDA_") or k.startswith("OMP_")
             or k.startswith("MKL_") or k.startswith("OPENBLAS_") or k.startswith("NUMEXPR_")
         }
+        # Strip CVD from forwarded env — workers get a per-GPU value from
+        # the initializer below, BEFORE cupy is imported in the subprocess
+        # (cupy initializes a CUDA context at import via stitch.stitch.utils,
+        # so CVD mutated later in the worker function is a no-op).
+        env_to_forward.pop("CUDA_VISIBLE_DEVICES", None)
 
         # Build (well, stripe) tasks. CRITICAL: stripe boundaries must
         # snap to SHARD CELL height, not chunk height. Multiple stripes
@@ -3073,13 +3095,35 @@ def stitch(
                     kwargs, blending_method, chunks_size, scale, env_to_forward,
                 ))
 
-        print(f"[Stripes] Dispatching {len(all_tasks)} tasks across {max_workers_env} workers "
-              f"({stripes_per_well} stripes/well × {num_wells} wells)")
-
+        # Build a per-worker GPU assignment queue. Each worker pulls one
+        # GPU id at startup and sets CUDA_VISIBLE_DEVICES BEFORE cupy is
+        # imported (cupy import is triggered by `from stitch.stitch.utils
+        # import xp, ...` at module load of assemble.py in the worker, so
+        # the initializer must set CVD before that import — which the
+        # initializer hook in PPE does, since user-module imports for the
+        # task only happen when the first task arrives).
         ctx = _mp.get_context("spawn")
+        gpu_queue = ctx.Manager().Queue()
+        # Round-robin assign GPUs across the worker pool. Put each gpu_id
+        # in the queue (workers_per_gpu) times so each worker gets one.
+        # Add a safety duplicate set in case a worker dies and respawns.
+        for _ in range(workers_per_gpu * 2):
+            for g in _stripe_avail_gpus:
+                gpu_queue.put(int(g))
+
+        print(f"[Stripes] Dispatching {len(all_tasks)} tasks across {max_workers_env} workers "
+              f"({stripes_per_well} stripes/well × {num_wells} wells), "
+              f"GPUs={_stripe_avail_gpus} × {workers_per_gpu} workers/GPU")
+
         completed = []
         failed = []
-        with _PPE(max_workers=max_workers_env, mp_context=ctx) as ex:
+        # Use the standalone helper module (no cupy/CUDA imports) so the
+        # initializer can run BEFORE this assemble.py is loaded in the
+        # worker — otherwise stitch.stitch.utils' top-level cupy import
+        # would initialize CUDA on the default device before CVD is set.
+        from stitch.stitch._stripe_gpu_init import stripe_worker_gpu_init
+        with _PPE(max_workers=max_workers_env, mp_context=ctx,
+                  initializer=stripe_worker_gpu_init, initargs=(gpu_queue,)) as ex:
             for result in ex.map(_process_stripe_subprocess_entry, all_tasks):
                 well_id, y_start, y_end, ok = result
                 if ok:
