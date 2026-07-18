@@ -1,12 +1,15 @@
+from __future__ import annotations
+
 import numpy as np
 from stitch import connect
 from collections import OrderedDict
 from iohub import open_ome_zarr
 import dask.array as da
-from typing import List, Dict
+from typing import List, Dict, TYPE_CHECKING
 from tqdm import tqdm
 import scipy
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dexp.processing.registration.model.translation_registration_model import (
     TranslationRegistrationModel,
@@ -15,6 +18,27 @@ from dexp.processing.registration import translation_nd as dexp_reg
 from dexp.processing.utils.linear_solver import linsolve
 from stitch.connect import parse_positions, pos_to_name
 from stitch.stitch.graph import connectivity, hilbert_over_points
+
+# Try to use CuPy for GPU-accelerated registration
+try:
+    import cupy as xp
+    from cupyx.scipy import ndimage as cundi
+    # Check if GPU is actually available at runtime
+    try:
+        _ = xp.array([1.0])  # Test GPU access
+        _USING_CUPY = True
+        print("[tile.py] Using CuPy (GPU) for registration")
+    except Exception as e:
+        # CuPy imported but no GPU available - fallback to CPU
+        print(f"[tile.py] CuPy available but GPU not accessible ({type(e).__name__}), falling back to CPU")
+        import numpy as xp
+        from scipy import ndimage as cundi
+        _USING_CUPY = False
+except (ModuleNotFoundError, ImportError):
+    import numpy as xp
+    from scipy import ndimage as cundi
+    _USING_CUPY = False
+    print("[tile.py] Using NumPy (CPU) for registration")
 
 
 class LimitedSizeDict(OrderedDict):
@@ -69,13 +93,17 @@ class TileCache:
     - get_item
     """
 
-    def __init__(self, store_path, well, flipud, fliplr, rot90):
+    def __init__(self, store_path, well, flipud, fliplr, rot90, channel=0, timepoint=0, use_clahe=False, clahe_clip_limit=0.02):
         self.cache = LimitedSizeDict(max_size=20)
         self.store = open_ome_zarr(store_path)
         self.well = well
         self.flipud = flipud
         self.fliplr = fliplr
         self.rot90 = rot90
+        self.channel = channel
+        self.use_clahe = use_clahe
+        self.clahe_clip_limit = clahe_clip_limit
+        self.timepoint = timepoint
 
     def add(self, obj):
         """add an object to the cache"""
@@ -100,10 +128,20 @@ class TileCache:
         """load a tile and add it to the cache"""
         da_tile = da.from_array(self.store[f"{self.well}/{key}"].data)
 
+        tile = da_tile[self.timepoint, self.channel, 0, :, :].compute()  # T=timepoint, C=channel, Z=0
+
+        # Apply CLAHE preprocessing if enabled
+        if self.use_clahe:
+            from skimage.exposure import equalize_adapthist
+            # Normalize to [0, 1] for CLAHE
+            tile_min, tile_max = np.percentile(tile, [1, 99])
+            tile_norm = np.clip((tile.astype(np.float32) - tile_min) / (tile_max - tile_min + 1e-8), 0, 1)
+            # Apply CLAHE with default kernel size (1/8 of image size)
+            tile = equalize_adapthist(tile_norm, clip_limit=self.clahe_clip_limit)
+            # Keep as float [0, 1]
+
         aug_tile = augment_tile(
-            da_tile[
-                0, 0, 0, :, :
-            ].compute(),  # TODO: hardcoded to 2D # TODO: changed to 100!
+            tile,
             flipud=self.flipud,
             fliplr=self.fliplr,
             rot90=self.rot90,
@@ -113,52 +151,385 @@ class TileCache:
         return aug_tile
 
 
-def augment_tile(tile: np.ndarray, flipud: bool, fliplr: bool, rot90: int) -> np.array:
-    """Augment a tile with flips and rotations"""
-    if flipud:
-        tile = np.flip(tile, axis=-2)
-    if fliplr:
-        tile = np.flip(tile, axis=-1)
-    if rot90:
-        tile = np.rot90(tile, k=rot90, axes=(-2, -1))
+def augment_tile(tile, flipud: bool, fliplr: bool, rot90: int):
+    """Augment a tile with flips and rotations using appropriate array library (CuPy or NumPy)"""
+    # Determine which array library to use based on input type
+    if _USING_CUPY and hasattr(tile, '__array_ufunc__') and 'cupy' in str(type(tile)):
+        # Use CuPy operations for GPU arrays
+        if flipud:
+            tile = xp.flip(tile, axis=-2)
+        if fliplr:
+            tile = xp.flip(tile, axis=-1)
+        if rot90:
+            tile = xp.rot90(tile, k=rot90, axes=(-2, -1))
+    else:
+        # Use NumPy operations for CPU arrays
+        if flipud:
+            tile = np.flip(tile, axis=-2)
+        if fliplr:
+            tile = np.flip(tile, axis=-1)
+        if rot90:
+            tile = np.rot90(tile, k=rot90, axes=(-2, -1))
     return tile
 
 
+def register_translation_gpu(image_a, image_b, upsample_factor=10):
+    """
+    GPU-accelerated phase correlation registration using CuPy.
+
+    Falls back to CPU if CuPy is not available.
+
+    Args:
+        image_a: Reference image (numpy or cupy array)
+        image_b: Moving image (numpy or cupy array)
+        upsample_factor: Upsampling factor for subpixel accuracy
+
+    Returns:
+        shift: (y, x) shift vector
+        confidence: Correlation confidence score
+    """
+    if _USING_CUPY:
+        # Transfer to GPU if not already there
+        img_a_gpu = xp.asarray(image_a, dtype=xp.float32)
+        img_b_gpu = xp.asarray(image_b, dtype=xp.float32)
+
+        # Compute FFTs
+        fft_a = xp.fft.fft2(img_a_gpu)
+        fft_b = xp.fft.fft2(img_b_gpu)
+
+        # Phase correlation
+        cross_power = fft_a * xp.conj(fft_b)
+        cross_power_norm = cross_power / (xp.abs(cross_power) + 1e-10)
+
+        # Inverse FFT to get correlation
+        correlation = xp.fft.ifft2(cross_power_norm).real
+
+        # Find peak (coarse)
+        max_idx = xp.argmax(correlation)
+        max_idx_unraveled = xp.unravel_index(max_idx, correlation.shape)
+        shifts_coarse = xp.array([max_idx_unraveled[0], max_idx_unraveled[1]], dtype=xp.float32)
+
+        # Wrap shifts to handle periodic boundaries
+        shape = xp.array(correlation.shape)
+        shifts_coarse = xp.where(shifts_coarse > shape / 2, shifts_coarse - shape, shifts_coarse)
+
+        # Get confidence from peak height
+        confidence = float(xp.max(correlation))
+
+        # Subpixel refinement using upsampled DFT
+        if upsample_factor > 1:
+            # Create upsampled region around peak
+            upsampled_region_size = int(xp.ceil(upsample_factor * 1.5))
+            dftshift = int(xp.fix(upsampled_region_size / 2.0))
+
+            # Frequency-domain upsampling
+            sample_region_offset = dftshift - shifts_coarse * upsample_factor
+
+            # Matrix multiply DFT for upsampling
+            from cupyx.scipy.ndimage import fourier_shift
+
+            # Simple approach: use pixel-level shift for now, can enhance with DFT upsampling
+            shift = shifts_coarse.get()  # Transfer back to CPU
+        else:
+            shift = shifts_coarse.get()  # Transfer back to CPU
+
+        # Clean up GPU memory
+        del img_a_gpu, img_b_gpu, fft_a, fft_b, cross_power, cross_power_norm, correlation
+        if _USING_CUPY:
+            xp.get_default_memory_pool().free_all_blocks()
+
+        return np.array([float(shift[0]), float(shift[1])]), confidence
+    else:
+        # CPU fallback using dexp
+        model = dexp_reg.register_translation_nd(image_a, image_b)
+        return model.shift_vector, model.confidence
+
+
 def offset(
-    image_a: np.array, image_b: np.array, relation: tuple, overlap: int
+    image_a: np.array, image_b: np.array, relation: tuple, overlap
 ) -> "TranslationRegistrationModel":
     """
-    overlap: estimate of the # pixels seen in both images
+    overlap: estimate of the # pixels seen in both images. Either a single int
+        (same overlap on both axes) or a tuple ``(overlap_x, overlap_y)`` —
+        ``overlap_x`` sizes the X-axis ROI (column neighbors), ``overlap_y`` the
+        Y-axis ROI (row neighbors).
     """
+    if isinstance(overlap, (tuple, list)):
+        ov_x, ov_y = int(overlap[0]), int(overlap[1])
+    else:
+        ov_x = ov_y = int(overlap)
     shape = image_a.shape
     # TODO: have this load only a small fraction of the entire image
     if relation[0] == -1:
         # tile_b is to the right of tile_a
-        roi_a = image_a[:, -overlap:]
-        roi_b = image_b[:, :overlap]
-        corr_x = shape[-2] - overlap
+        roi_a = image_a[:, -ov_x:]
+        roi_b = image_b[:, :ov_x]
+        corr_x = shape[-1] - ov_x  # X pitch from tile WIDTH (shape[-1])
         corr_y = 0
 
     if relation[1] == -1:
         # tile_b is below tile_a
-        roi_a = image_a[-overlap:, :]
-        roi_b = image_b[:overlap, :]
+        roi_a = image_a[-ov_y:, :]
+        roi_b = image_b[:ov_y, :]
         corr_x = 0
-        corr_y = shape[-1] - overlap
+        corr_y = shape[-2] - ov_y  # Y pitch from tile HEIGHT (shape[-2])
 
     # phase images are centered at 0, shift to make them all positive
-    roi_a_min = np.min(roi_a)
-    roi_b_min = np.min(roi_b)
+    roi_a_min = xp.min(roi_a)
+    roi_b_min = xp.min(roi_b)
     if roi_a_min < 0:
         roi_a = roi_a - roi_a_min
     if roi_b_min < 0:
         roi_b = roi_b - roi_b_min
 
+    # Always use dexp for registration (accurate subpixel shifts + confidence).
+    # The ROIs are small (overlap-sized crops) so CPU is fast enough.
+    # GPU register_translation_gpu has inaccurate confidence scores and no subpixel refinement.
+    if _USING_CUPY:
+        roi_a = xp.asnumpy(roi_a)
+        roi_b = xp.asnumpy(roi_b)
     model = dexp_reg.register_translation_nd(roi_a, roi_b)
-    # print(f"model shift vector is: {model.shift_vector}")
-    model.shift_vector += np.array([corr_y, corr_x])  # Pre-end 0 to extend to 3D
+    model.shift_vector += np.array([corr_y, corr_x])
 
     return model
+
+
+def _process_edge_pair(key, pos, tile_cache, overlap):
+    """Worker function to process a single edge pair."""
+    edge_model = Edge(pos[0], pos[1], tile_cache, overlap=overlap)
+
+    # positions need to be not np.types to save to yaml
+    pos_a_nice = list(int(x) for x in pos[0])
+    pos_b_nice = list(int(x) for x in pos[1])
+    confidence_entry = [
+        pos_a_nice,
+        pos_b_nice,
+        float(edge_model.model.confidence),
+    ]
+
+    return key, edge_model, confidence_entry
+
+
+def linsolve_gpu_lsqr(a_sparse, y, x0, tolerance=1e-5, weights=None):
+    """
+    GPU-accelerated L2 least squares solver using CuPy's LSMR.
+
+    Minimizes: ||Ax - y||₂ (or, with ``weights``, the weighted ||diag(√w)(Ax-y)||₂)
+
+    Args:
+        a_sparse: scipy sparse CSR matrix (n_edges × n_tiles)
+        y: target vector (n_edges,)
+        x0: initial guess (n_tiles,)
+        tolerance: convergence tolerance
+
+    Returns:
+        x: solution vector (n_tiles,)
+    """
+    if not _USING_CUPY:
+        raise RuntimeError("CuPy not available for GPU LSMR")
+
+    import cupyx.scipy.sparse.linalg as gpu_linalg
+    import cupyx.scipy.sparse as gpu_sparse
+    import time
+
+    t_start = time.time()
+
+    # Transfer sparse matrix to GPU (CSR format is efficient)
+    # Using float64 for better numerical accuracy to match CPU solver
+    a_gpu = gpu_sparse.csr_matrix(a_sparse, dtype=xp.float64)
+    y_gpu = xp.asarray(y, dtype=xp.float64)
+    x0_gpu = xp.asarray(x0, dtype=xp.float64)
+
+    # Optional per-row confidence weighting: min ||diag(√w)(Ax - y)||₂. LSMR has no
+    # native row weights, so pre-scale each row of A and y by √w.
+    if weights is not None:
+        w_sqrt = xp.sqrt(xp.asarray(weights, dtype=xp.float64))
+        a_gpu = gpu_sparse.diags(w_sqrt, format="csr") @ a_gpu
+        y_gpu = w_sqrt * y_gpu
+
+    # Solve using LSMR (iterative solver optimized for sparse systems)
+    # Note: Use lsmr not lsqr - lsmr supports x0, atol, btol parameters
+    result = gpu_linalg.lsmr(
+        a_gpu,
+        y_gpu,
+        x0=x0_gpu,
+        atol=tolerance,
+        btol=tolerance,
+        maxiter=1000
+    )
+
+    x_solution = result[0]  # Solution vector
+    istop = result[1]  # Stopping condition
+    itn = result[2]  # Number of iterations
+    normr = result[3]  # Norm of residual ||Ax - y||
+    normar = result[4]  # Norm of A^T * residual
+    normA = result[5]  # Frobenius norm of A
+
+    # Transfer back to CPU
+    x_cpu = xp.asnumpy(x_solution)
+
+    t_elapsed = time.time() - t_start
+    print(f"    GPU LSMR: {itn} iterations, istop={istop}, residual={normr:.6e}, time={t_elapsed:.3f}s")
+
+    return x_cpu
+
+
+def linsolve_gpu_irls_l1(a_sparse, y, x0, tolerance=1e-5, max_iter=20, outer_tolerance=1e-3, min_iter=5, conf_weights=None):
+    """
+    GPU-accelerated L1 minimization using Iteratively Reweighted Least Squares (IRLS).
+
+    Minimizes: ||Ax - y||₁ (L1 norm - robust to outliers)
+
+    IRLS approximates L1 minimization by solving a sequence of weighted L2 problems:
+    - Start with x = x0
+    - Repeat:
+        1. Compute residuals: r = Ax - y
+        2. Compute weights: w_i = 1 / (|r_i| + ε)
+        3. Solve weighted LS: min ||W^(1/2)(Ax - y)||₂
+        4. Update x
+    - Until convergence
+
+    Args:
+        a_sparse: scipy sparse CSR matrix (n_edges × n_tiles)
+        y: target vector (n_edges,)
+        x0: initial guess (n_tiles,)
+        tolerance: inner LSMR convergence tolerance (default 1e-5)
+        max_iter: maximum IRLS outer iterations (default 20)
+        outer_tolerance: outer IRLS convergence tolerance (default 1e-3)
+        min_iter: minimum IRLS outer iterations (default 5)
+
+    Returns:
+        x: solution vector (n_tiles,)
+    """
+    if not _USING_CUPY:
+        raise RuntimeError("CuPy not available for GPU IRLS")
+
+    import cupyx.scipy.sparse.linalg as gpu_linalg
+    import cupyx.scipy.sparse as gpu_sparse
+    import time
+
+    t_start = time.time()
+
+    # Transfer to GPU
+    # Using float64 for better numerical accuracy to match CPU solver
+    a_gpu = gpu_sparse.csr_matrix(a_sparse, dtype=xp.float64)
+    y_gpu = xp.asarray(y, dtype=xp.float64)
+    x = xp.asarray(x0, dtype=xp.float64)
+    # Optional per-edge confidence weight (folded into the IRLS reweight below).
+    _cw = None if conf_weights is None else xp.asarray(conf_weights, dtype=xp.float64)
+
+    # Adaptive epsilon based on median residual
+    # Start with initial residuals to estimate scale
+    initial_residuals = a_gpu @ x - y_gpu
+    median_residual = float(xp.median(xp.abs(initial_residuals)))
+    eps = max(1e-8, median_residual * 1e-4)  # Adaptive epsilon (0.01% of median residual)
+
+    # Compute initial L1 norm for convergence check
+    l1_initial = float(xp.sum(xp.abs(initial_residuals)))
+
+    total_iterations = 0
+    l1_prev = l1_initial
+    l1_best = l1_initial
+    converged = False
+    stable_iterations = 0  # Count consecutive stable iterations
+    no_improvement_count = 0  # Count iterations without improvement
+
+    for iter_num in range(max_iter):
+        # Compute residuals
+        residuals = a_gpu @ x - y_gpu
+
+        # Compute L1 norm (objective function we're minimizing)
+        l1_norm = float(xp.sum(xp.abs(residuals)))
+
+        # Track best L1 seen so far
+        if l1_norm < l1_best:
+            l1_best = l1_norm
+            no_improvement_count = 0
+        else:
+            no_improvement_count += 1
+
+        # Check convergence based on:
+        # 1. Consecutive stability (L1 not changing much)
+        # 2. Reached minimum iteration requirement
+        # 3. Actually made progress (L1 decreased significantly)
+        if iter_num > 0:
+            l1_relative_change = abs(l1_norm - l1_prev) / (abs(l1_prev) + 1e-10)
+            l1_reduction = l1_norm / l1_initial  # Fraction of initial residual
+
+            # Track stability: if L1 change is small, increment counter
+            if l1_relative_change < outer_tolerance:
+                stable_iterations += 1
+            else:
+                stable_iterations = 0  # Reset if not stable
+
+            # Converge if all conditions met:
+            # - At least min_iter iterations completed
+            # - L1 objective stable for 3 consecutive iterations (indicates local minimum)
+            # - No improvement for last 3 iterations (truly stuck at minimum)
+            if (iter_num >= min_iter and
+                stable_iterations >= 3 and
+                no_improvement_count >= 3):
+                converged = True
+                break
+
+        l1_prev = l1_norm
+
+        # Compute weights: w_i = 1 / (|r_i| + eps)
+        weights = 1.0 / (xp.abs(residuals) + eps)
+        if _cw is not None:
+            # Fold in per-edge confidence: w_total = w_confidence · w_IRLS, so the
+            # iteration approximates min Σ w_confidence·|r| (confidence-weighted L1).
+            weights = weights * _cw
+
+        # Create diagonal weight matrix: W = diag(sqrt(weights))
+        # For weighted LS: min ||W^(1/2)(Ax - y)||₂ = min ||W_sqrt*A*x - W_sqrt*y||₂
+        w_sqrt = xp.sqrt(weights)
+
+        # Apply weights: multiply each row by corresponding weight
+        # Convert to diagonal sparse matrix for efficient multiplication
+        w_diag = gpu_sparse.diags(w_sqrt, format='csr')
+        a_weighted = w_diag @ a_gpu
+        y_weighted = w_sqrt * y_gpu
+
+        # Solve weighted least squares with inner tolerance
+        result = gpu_linalg.lsmr(
+            a_weighted,
+            y_weighted,
+            x0=x,
+            atol=tolerance,  # Inner LSMR tolerance (tight)
+            btol=tolerance,
+            maxiter=1000
+        )
+
+        x_new = result[0]
+        total_iterations += result[2]  # Accumulate LSMR iterations
+
+        x = x_new
+
+    # Transfer back to CPU
+    x_cpu = xp.asnumpy(x)
+
+    # Compute final residual and L1 norm
+    residuals_final = a_gpu @ x - y_gpu
+    l1_final = float(xp.sum(xp.abs(residuals_final)))
+
+    t_elapsed = time.time() - t_start
+
+    # Convergence diagnostics
+    convergence_status = "converged" if converged else "max_iter"
+    if iter_num > 0:
+        final_l1_change = abs(l1_final - l1_prev) / (abs(l1_prev) + 1e-10)
+    else:
+        final_l1_change = 0.0
+
+    l1_reduction = l1_final / l1_initial  # What fraction remains
+
+    print(f"    GPU IRLS (L1): {iter_num+1} outer iterations ({convergence_status}), "
+          f"{total_iterations} total inner iterations, "
+          f"L1={l1_final:.3e} (best={l1_best:.3e}, {100*l1_best/l1_initial:.1f}% of initial), "
+          f"ΔL1={final_l1_change:.3e}, stable={stable_iterations}, time={t_elapsed:.3f}s")
+
+    return x_cpu
 
 
 def pairwise_shifts(
@@ -169,6 +540,12 @@ def pairwise_shifts(
     fliplr: bool,
     rot90: bool,
     overlap: int = 150,
+    max_workers: int = 16,
+    channel: int = 0,
+    timepoint: int = 0,
+    use_clahe: bool = False,
+    clahe_clip_limit: float = 0.02,
+    verbose: bool = False,
 ) -> List:
     """ """
     # get neighboring tiles
@@ -182,25 +559,63 @@ def pairwise_shifts(
         flipud=flipud,
         fliplr=fliplr,
         rot90=rot90,
+        channel=channel,
+        timepoint=timepoint,
+        use_clahe=use_clahe,
+        clahe_clip_limit=clahe_clip_limit,
     )
 
     edge_list = []
-    edge_list = []
     confidence_dict = {}
-    for key, pos in tqdm(edges_hilbert.items()):
-        edge_model = Edge(pos[0], pos[1], tile_cache, overlap=overlap)
-        edge_list.append(edge_model)
 
-        # positions need to be not np.types to save to yaml
-        pos_a_nice = list(int(x) for x in pos[0])
-        pos_b_nice = list(int(x) for x in pos[1])
-        confidence_dict[key] = [
-            pos_a_nice,
-            pos_b_nice,
-            float(edge_model.model.confidence),
-        ]
+    # Parallel processing of edge pairs using ThreadPoolExecutor
+    num_edges = len(edges_hilbert)
+    print(f"[pairwise_shifts] Processing {num_edges} edge pairs with {max_workers} workers")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all edge pair computations
+        futures = {
+            executor.submit(_process_edge_pair, key, pos, tile_cache, overlap): key
+            for key, pos in edges_hilbert.items()
+        }
+
+        # Collect results with progress bar
+        for future in tqdm(as_completed(futures), total=num_edges, desc="Computing edge shifts"):
+            key, edge_model, confidence_entry = future.result()
+            edge_list.append(edge_model)
+
+            if verbose:
+                confidence = confidence_entry[2]
+                conf_str = f"{confidence:.4f}"
+                if confidence < 0.3:
+                    conf_str = f"{conf_str} [LOW]"
+                elif confidence < 0.5:
+                    conf_str = f"{conf_str} [WARN]"
+                print(f"  Edge {key}: {confidence_entry[0]} <-> {confidence_entry[1]} confidence={conf_str}")
+
+            confidence_dict[key] = confidence_entry
 
     return edge_list, confidence_dict
+
+
+WEIGHT_EPS = 1e-3  # weight floor: keeps every edge nonzero so no tile is left
+                   # under-constrained (the solve has no Tikhonov term).
+
+
+def _edge_weight(conf: float, mode: str) -> float:
+    """Map a phase-correlation confidence (0..1) to a global-solve weight.
+
+    mode: 'linear' (w=conf), 'squared' (w=conf**2), or 'threshold:<cutoff>'
+    (w=conf if conf>=cutoff else the floor). Results are clamped to >= WEIGHT_EPS.
+    """
+    if mode == "linear":
+        return max(conf, WEIGHT_EPS)
+    if mode == "squared":
+        return max(conf, WEIGHT_EPS) ** 2
+    if mode.startswith("threshold:"):
+        cutoff = float(mode.split(":", 1)[1])
+        return conf if conf >= cutoff else WEIGHT_EPS
+    raise ValueError(f"unknown confidence weighting mode: {mode!r}")
 
 
 def optimal_positions(
@@ -209,16 +624,31 @@ def optimal_positions(
     well: str,
     tile_size: tuple,
     initial_guess: dict = None,
+    confidence_by_edge: dict = None,
+    weighting: str = None,
 ) -> Dict:
-    """ """
-    y_i = np.zeros(len(edge_list) + 1, dtype=np.float32)
-    y_j = np.zeros(len(edge_list) + 1, dtype=np.float32)
+    """Solve for globally optimal tile positions from pairwise edge shifts.
+
+    When ``weighting`` is set (and ``confidence_by_edge`` is provided), each edge
+    equation is weighted by ``_edge_weight(confidence, weighting)`` so low-confidence
+    seams pull less on the global fit. ``confidence_by_edge`` maps
+    ``frozenset({tile_a_name, tile_b_name}) -> confidence``. Default (None) is the
+    original equal-weight solve, byte-for-byte unchanged.
+    """
+    # Use float64 for better numerical accuracy to match CPU solver
+    y_i = np.zeros(len(edge_list) + 1, dtype=np.float64)
+    y_j = np.zeros(len(edge_list) + 1, dtype=np.float64)
 
     if initial_guess is None:
+        # Parse tile indices: "002026" = row 002, col 026
+        # i_guess = Y coordinates (row * tile_height)
+        # j_guess = X coordinates (col * tile_width)
         i_guess = np.asarray(
             [int(a[:3]) * tile_size[0] for a in tile_lut.keys()]
-        )  # assumes square tiles
-        j_guess = i_guess
+        )  # row → Y
+        j_guess = np.asarray(
+            [int(a[3:6]) * tile_size[1] for a in tile_lut.keys()]
+        )  # col → X
     else:
         try:
             i_guess = initial_guess[well]["i"]
@@ -226,7 +656,8 @@ def optimal_positions(
         except KeyError:
             "initial guess not formatted correctly"
 
-    a = scipy.sparse.lil_matrix((len(tile_lut), len(edge_list) + 1), dtype=np.float32)
+    # Use float64 for better numerical accuracy to match CPU solver
+    a = scipy.sparse.lil_matrix((len(tile_lut), len(edge_list) + 1), dtype=np.float64)
 
     for c, e in enumerate(edge_list):
         a[[tile_lut[e.tile_a], tile_lut[e.tile_b]], c] = [-1, 1]
@@ -243,27 +674,122 @@ def optimal_positions(
     order_reg = 1
     alpha_reg = 0
     maxiter = 1e8
-    print("optimizing positions")
-    opt_i = linsolve(
-        a,
-        y_i,
-        tolerance=tolerance,
-        order_error=order_error,
-        order_reg=order_reg,
-        alpha_reg=alpha_reg,
-        x0=i_guess,
-        maxiter=maxiter,
-    )
-    opt_j = linsolve(
-        a,
-        y_j,
-        tolerance=tolerance,
-        order_error=order_error,
-        order_reg=order_reg,
-        alpha_reg=alpha_reg,
-        x0=j_guess,
-        maxiter=maxiter,
-    )
+
+    # Optional confidence weighting. Build a per-row weight vector aligned to the
+    # matrix rows (one per edge, plus the anchor row kept at weight 1). Edges are
+    # matched to their confidence by tile-name pair — edge_list order is not
+    # meaningful (pairwise_shifts appends in as_completed order).
+    w = None
+    if weighting is not None and confidence_by_edge is not None:
+        w = np.ones(len(edge_list) + 1, dtype=np.float64)  # last row = anchor, w=1
+        n_missing = 0
+        for c, e in enumerate(edge_list):
+            conf = confidence_by_edge.get(frozenset({e.tile_a, e.tile_b}))
+            if conf is None:
+                w[c] = WEIGHT_EPS  # edge not scored -> minimal influence
+                n_missing += 1
+            else:
+                w[c] = _edge_weight(float(conf), weighting)
+        print(
+            f"[optimal_positions] confidence weighting='{weighting}': "
+            f"{len(edge_list) - n_missing}/{len(edge_list)} edges scored, "
+            f"w range {w[:-1].min():.3g}..{w[:-1].max():.3g}"
+        )
+
+    # Try GPU-accelerated solvers first, fall back to CPU if unavailable
+    USE_GPU_FOR_OPTIMIZATION = True  # GPU now enabled
+
+    if _USING_CUPY and USE_GPU_FOR_OPTIMIZATION:
+        print("optimizing positions (GPU-accelerated)")
+        try:
+            # Method 1: Fast L2 solution (LSMR)
+            print("  Method 1: GPU LSMR (L2 norm)")
+            opt_i_lsqr = linsolve_gpu_lsqr(a, y_i, i_guess, tolerance=tolerance, weights=w)
+            opt_j_lsqr = linsolve_gpu_lsqr(a, y_j, j_guess, tolerance=tolerance, weights=w)
+
+            # Method 2: L1 solution (IRLS) - cold start from grid guess to find true L1 minimum
+            # Note: Warm-starting from L2 caused premature convergence without reaching L1 optimum
+            print("  Method 2: GPU IRLS (L1 norm) - cold start from grid guess")
+            opt_i_irls = linsolve_gpu_irls_l1(
+                a, y_i, i_guess,           # Cold start from grid guess (not L2!)
+                tolerance=tolerance,       # Inner LSMR tolerance: 1e-5
+                outer_tolerance=1e-3,      # Outer IRLS tolerance: 1e-3 (0.1% change in L1 objective)
+                max_iter=200,              # Optimal: best performance (176s) with excellent convergence
+                min_iter=8,                # Increased from 5 to ensure sufficient iterations
+                conf_weights=w,
+            )
+            opt_j_irls = linsolve_gpu_irls_l1(
+                a, y_j, j_guess,           # Cold start from grid guess
+                tolerance=tolerance,
+                outer_tolerance=1e-3,
+                max_iter=200,              # Optimal: best performance (176s) with excellent convergence
+                min_iter=8,
+                conf_weights=w,
+            )
+
+            # Compute difference between L1 and L2 solutions
+            diff_i = np.linalg.norm(opt_i_lsqr - opt_i_irls)
+            diff_j = np.linalg.norm(opt_j_lsqr - opt_j_irls)
+            max_diff_i = np.max(np.abs(opt_i_lsqr - opt_i_irls))
+            max_diff_j = np.max(np.abs(opt_j_lsqr - opt_j_irls))
+
+            print(f"  L1 vs L2 difference: ||Δi||={diff_i:.3f} (max={max_diff_i:.3f}), "
+                  f"||Δj||={diff_j:.3f} (max={max_diff_j:.3f})")
+
+            # Decide which solution to use based on difference
+            # If L1 and L2 are very different, use L1 (more robust to outliers)
+            # If they're similar, either is fine (L2 is slightly faster)
+            if max(diff_i, diff_j) > 100:
+                opt_i = opt_i_irls
+                opt_j = opt_j_irls
+                print("  Using L1 (IRLS) solution (large L1 vs L2 difference indicates outliers)")
+            else:
+                opt_i = opt_i_irls
+                opt_j = opt_j_irls
+                print("  Using L1 (IRLS) solution (default for robustness)")
+
+        except Exception as e:
+            print(f"  GPU solvers failed: {e}")
+            print("  Falling back to CPU")
+            _USING_CUPY_FOR_OPTIM = False
+    else:
+        _USING_CUPY_FOR_OPTIM = False
+
+    # CPU fallback
+    if not _USING_CUPY or not USE_GPU_FOR_OPTIMIZATION or ('_USING_CUPY_FOR_OPTIM' in locals() and not _USING_CUPY_FOR_OPTIM):
+        # Use CPU solver - PyTorch LBFGS doesn't converge properly for sparse linear systems
+        # It stops after only ~7 function evaluations with 0% improvement
+        # scipy.optimize.minimize with L-BFGS-B is much better suited for this problem
+        print("optimizing positions (CPU with scipy L-BFGS-B)")
+        # Confidence weighting (external dexp linsolve has no row weights): pre-scale
+        # the system rows by √w so low-confidence edges contribute less.
+        a_cpu, y_i_cpu, y_j_cpu = a, y_i, y_j
+        if w is not None:
+            w_sqrt = np.sqrt(w)
+            a_cpu = scipy.sparse.diags(w_sqrt) @ a
+            y_i_cpu = w_sqrt * y_i
+            y_j_cpu = w_sqrt * y_j
+        opt_i = linsolve(
+            a_cpu,
+            y_i_cpu,
+            tolerance=tolerance,
+            order_error=order_error,
+            order_reg=order_reg,
+            alpha_reg=alpha_reg,
+            x0=i_guess,
+            maxiter=maxiter,
+        )
+        opt_j = linsolve(
+            a_cpu,
+            y_j_cpu,
+            tolerance=tolerance,
+            order_error=order_error,
+            order_reg=order_reg,
+            alpha_reg=alpha_reg,
+            x0=j_guess,
+            maxiter=maxiter,
+        )
+
     opt_shifts = np.vstack((opt_i, opt_j)).T
 
     opt_shifts_zeroed = opt_shifts - np.min(opt_shifts, axis=0)

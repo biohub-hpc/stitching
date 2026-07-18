@@ -6,15 +6,32 @@ build-backend = "hatchling.build"
 name = "stitch"
 version = "0.1"
 description = "stitching of multi-fov microscopy datasets"
+requires-python = ">=3.12,<3.13"
 
 authors = [
     { name = "Alex Hillsley", email = "alexander.hillsley@czbiohub.org" },
 ]
-#TODO: add dependencies
 dependencies = [
-    
+    "numpy",
+    "scipy",
+    "dask[array,distributed]",
+    "zarr",
+    "tqdm",
+    "pyyaml",
+    "iohub>=0.3.0a7",
+    "scikit-image",  # for CLAHE preprocessing
+    "dexp",  # for registration
+    "joblib",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "cupy-cuda12x",
 ]
 
 # Hatch config
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["stitch"]
